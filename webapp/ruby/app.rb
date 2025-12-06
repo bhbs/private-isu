@@ -3,6 +3,9 @@ require 'mysql2'
 require 'rack-flash'
 require 'shellwords'
 require 'rack/session/dalli'
+require 'fileutils'
+require 'openssl'
+require 'dalli'
 
 module Isuconp
   class App < Sinatra::Base
@@ -16,6 +19,10 @@ module Isuconp
     UPLOAD_LIMIT = 10 * 1024 * 1024 # 10mb
 
     POSTS_PER_PAGE = 20
+
+    IMAGE_DIR = File.expand_path('../../public/image', __FILE__)
+
+    MAKE_POSTS_MEMBERS = 'p.id, p.user_id, p.body, p.created_at, p.mime, p.comment_count, u.account_name'
 
     helpers do
       def config
@@ -46,6 +53,15 @@ module Isuconp
         client
       end
 
+      def memcached
+        return Thread.current[:isuconp_memcached] if Thread.current[:isuconp_memcached]
+        client = Dalli::Client.new(
+          ENV['ISUCONP_MEMCACHED_ADDRESS'] || 'localhost:11211'
+        )
+        Thread.current[:isuconp_memcached] = client
+        client
+      end
+
       def db_initialize
         sql = []
         sql << 'DELETE FROM users WHERE id > 1000'
@@ -53,6 +69,7 @@ module Isuconp
         sql << 'DELETE FROM comments WHERE id > 100000'
         sql << 'UPDATE users SET del_flg = 0'
         sql << 'UPDATE users SET del_flg = 1 WHERE id % 50 = 0'
+        sql << "UPDATE posts SET comment_count = (SELECT COUNT(*) FROM comments WHERE comments.post_id = posts.id)"
         sql.each do |s|
           db.prepare(s).execute
         end
@@ -77,8 +94,7 @@ module Isuconp
       end
 
       def digest(src)
-        # opensslのバージョンによっては (stdin)= というのがつくので取る
-        `printf "%s" #{Shellwords.shellescape(src)} | openssl dgst -sha512 | sed 's/^.*= //'`.strip
+        return OpenSSL::Digest::SHA512.hexdigest(src)
       end
 
       def calculate_salt(account_name)
@@ -100,35 +116,54 @@ module Isuconp
       end
 
       def make_posts(results, all_comments: false)
-        posts = []
-        results.to_a.each do |post|
-          post[:comment_count] = db.prepare('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?').execute(
-            post[:id]
-          ).first[:count]
+        posts = results.to_a
 
-          query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-          unless all_comments
-            query += ' LIMIT 3'
+        count_keys = posts.map{|post| "comments.#{post[:id]}.count"}
+        cached_counts = memcached.get_multi(count_keys)
+
+        comments_query_base = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
+        comments_query_base += ' LIMIT 3' unless all_comments
+        comments_stmt = db.prepare(comments_query_base)
+
+        posts.each do |post|
+          cached_comments = memcached.get("comments.#{post[:id]}.#{all_comments.to_s}")
+          if cached_comments
+            post[:comments] = cached_comments
+          else
+            comments = comments_stmt.execute(post[:id]).to_a
+            comments.each do |comment|
+              comment[:user] = { account_name: comment[:account_name] }
+            end
+            post[:comments] = comments.reverse
+            post[:comments] = post[:comments].map { |comment| normalize_comment(comment) }
+            memcached.set("comments.#{post[:id]}.#{all_comments.to_s}", post[:comments], 10)
           end
-          comments = db.prepare(query).execute(
-            post[:id]
-          ).to_a
-          comments.each do |comment|
-            comment[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-              comment[:user_id]
-            ).first
-          end
-          post[:comments] = comments.reverse
 
-          post[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            post[:user_id]
-          ).first
-
-          posts.push(post) if post[:user][:del_flg] == 0
-          break if posts.length >= POSTS_PER_PAGE
+          post[:user] = {
+            account_name: post[:account_name],
+          }
         end
 
         posts
+      end
+
+      def normalize_comment(comment)
+        return { user: { account_name: '' }, comment: '' } if comment.nil?
+
+        comment = comment.transform_keys { |k| k.respond_to?(:to_sym) ? k.to_sym : k } if comment.respond_to?(:transform_keys)
+
+        user = comment[:user]
+        if !user.is_a?(Hash)
+          user = {}
+        else
+          user = user.transform_keys { |k| k.respond_to?(:to_sym) ? k.to_sym : k }
+        end
+
+        account_name = user[:account_name] || comment[:account_name]
+        user[:account_name] ||= account_name || ''
+
+        comment[:user] = user
+        comment
       end
 
       def image_url(post)
@@ -225,7 +260,20 @@ module Isuconp
     get '/' do
       me = get_session_user()
 
-      results = db.query('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
+      results = db.query(<<~SQL)
+        SELECT
+          #{MAKE_POSTS_MEMBERS}
+        FROM (
+            SELECT id, user_id, body, created_at, mime, comment_count
+            FROM posts
+            ORDER BY created_at DESC
+            LIMIT 40
+        ) AS p
+        JOIN users AS u ON p.user_id = u.id
+        WHERE u.del_flg = 0
+        ORDER BY p.created_at DESC
+        LIMIT #{POSTS_PER_PAGE};
+      SQL
       posts = make_posts(results)
 
       erb :index, layout: :layout, locals: { posts: posts, me: me }
@@ -240,9 +288,13 @@ module Isuconp
         return 404
       end
 
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC').execute(
-        user[:id]
-      )
+      results = db.prepare(<<~SQL).execute(user[:id])
+        SELECT #{MAKE_POSTS_MEMBERS}
+        FROM `posts` AS p FORCE INDEX (posts_user_idx) JOIN `users` AS u ON (p.user_id=u.id)
+        WHERE p.user_id = ? AND u.del_flg = 0
+        ORDER BY p.created_at DESC
+        LIMIT #{POSTS_PER_PAGE}
+      SQL
       posts = make_posts(results)
 
       comment_count = db.prepare('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?').execute(
@@ -269,18 +321,34 @@ module Isuconp
 
     get '/posts' do
       max_created_at = params['max_created_at']
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC').execute(
-        max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime
-      )
+      if max_created_at.nil?
+        results = db.prepare(<<~SQL).execute
+        SELECT #{MAKE_POSTS_MEMBERS}
+        FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id)
+        WHERE u.del_flg = 0
+        ORDER BY p.created_at DESC
+        LIMIT #{POSTS_PER_PAGE}
+        SQL
+      else
+        results = db.prepare(<<~SQL).execute(Time.iso8601(max_created_at).localtime)
+          SELECT #{MAKE_POSTS_MEMBERS}
+          FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id)
+          WHERE p.created_at < ? AND u.del_flg = 0
+          ORDER BY p.created_at DESC
+          LIMIT #{POSTS_PER_PAGE}
+        SQL
+      end
       posts = make_posts(results)
 
       erb :posts, layout: false, locals: { posts: posts }
     end
 
     get '/posts/:id' do
-      results = db.prepare('SELECT * FROM `posts` WHERE `id` = ?').execute(
-        params[:id]
-      )
+      results = db.prepare(<<~SQL).execute(params[:id])
+        SELECT #{MAKE_POSTS_MEMBERS}
+        FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id)
+        WHERE p.id = ? AND u.del_flg = 0
+      SQL
       posts = make_posts(results, all_comments: true)
 
       return 404 if posts.length == 0
@@ -304,33 +372,36 @@ module Isuconp
       end
 
       if params['file']
-        mime = ''
+        mime, ext = '', ''
         # 投稿のContent-Typeからファイルのタイプを決定する
         if params["file"][:type].include? "jpeg"
-          mime = "image/jpeg"
+          mime, ext = "image/jpeg", "jpg"
         elsif params["file"][:type].include? "png"
-          mime = "image/png"
+          mime, ext = "image/png", "png"
         elsif params["file"][:type].include? "gif"
-          mime = "image/gif"
+          mime, ext = "image/gif", "gif"
         else
           flash[:notice] = '投稿できる画像形式はjpgとpngとgifだけです'
           redirect '/', 302
         end
 
-        if params['file'][:tempfile].read.length > UPLOAD_LIMIT
+        if params['file'][:tempfile].size > UPLOAD_LIMIT
           flash[:notice] = 'ファイルサイズが大きすぎます'
           redirect '/', 302
         end
 
-        params['file'][:tempfile].rewind
         query = 'INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)'
         db.prepare(query).execute(
           me[:id],
           mime,
-          params["file"][:tempfile].read,
+          '',
           params["body"],
         )
         pid = db.last_id
+
+        imgfile = IMAGE_DIR + "/#{pid}.#{ext}"
+        FileUtils.mv(params['file'][:tempfile], imgfile)
+        FileUtils.chmod(0644, imgfile)
 
         redirect "/posts/#{pid}", 302
       else
@@ -350,6 +421,11 @@ module Isuconp
           (params[:ext] == "png" && post[:mime] == "image/png") ||
           (params[:ext] == "gif" && post[:mime] == "image/gif")
         headers['Content-Type'] = post[:mime]
+
+        imgfile = IMAGE_DIR + "/#{post[:id]}.#{params[:ext]}"
+        f = File.open(imgfile, "w")
+        f.write(post[:imgdata])
+        f.close()
         return post[:imgdata]
       end
 
