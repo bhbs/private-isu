@@ -9,6 +9,7 @@ import crypto from 'crypto'
 import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import fs from 'fs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -82,12 +83,45 @@ interface SessionData {
   flashNotice?: string
 }
 
+type PostRow = {
+  id: number
+  user_id: number
+  body: string
+  created_at: Date
+  mime: string
+  comment_count: number
+  account_name: string
+  passhash: string
+  authority: number
+  del_flg: number
+  user_created_at: Date
+}
+
+type CommentRow = {
+  id: number
+  post_id: number
+  user_id: number
+  comment: string
+  created_at: Date
+  account_name: string
+  passhash?: string
+  authority?: number
+  del_flg?: number
+  user_created_at?: Date
+}
+
 const memcachedAddress = process.env.ISUCONP_MEMCACHED_ADDRESS || 'localhost:11211'
 const memcached = new Memcached(memcachedAddress)
 const SESSION_KEY_PREFIX = 'isuconp-node.session:'
 const DEFAULT_SESSION_TTL = 24 * 60 * 60
 const parsedTtl = Number(process.env.ISUCONP_SESSION_TTL)
 const SESSION_TTL = Number.isFinite(parsedTtl) && parsedTtl > 0 ? Math.floor(parsedTtl) : DEFAULT_SESSION_TTL
+const COMMENT_CACHE_TTL = 10
+const IMAGE_DIR = path.join(__dirname, '../../public/image')
+
+if (!fs.existsSync(IMAGE_DIR)) {
+  fs.mkdirSync(IMAGE_DIR, { recursive: true })
+}
 
 function generateSessionId(): string {
   return crypto.randomBytes(16).toString('hex')
@@ -266,6 +300,7 @@ async function dbInitialize(): Promise<void> {
   ]
   await Promise.all(sqls.map((sql) => db.query<ResultSetHeader>(sql)))
   await db.query<ResultSetHeader>('UPDATE users SET del_flg = 1 WHERE id % 50 = 0')
+  await db.query<ResultSetHeader>('UPDATE posts SET comment_count = (SELECT COUNT(*) FROM comments WHERE comments.post_id = posts.id)')
 }
 
 function imageUrl(post: Pick<Post, 'id' | 'mime'>): string {
@@ -284,33 +319,150 @@ function imageUrl(post: Pick<Post, 'id' | 'mime'>): string {
   return `/image/${post.id}${ext}`
 }
 
-async function makeComment(comment: Comment): Promise<Comment> {
-  comment.user = await getUser(comment.user_id)
-  return comment
+function commentCacheKey(postId: number, allComments: boolean): string {
+  return `comments.${postId}.${allComments ? 'all' : 'recent'}`
 }
 
-async function makePost(post: Post, options: CommentOptions = {}): Promise<Post> {
-  const [[countRow]] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', [post.id])
-  post.comment_count = (countRow as CountRow | undefined)?.count || 0
-  let query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-  if (!options.allComments) {
+function parseCachedComments(raw: unknown): Comment[] | undefined {
+  let payload: string | undefined
+  if (typeof raw === 'string') {
+    payload = raw
+  } else if (Buffer.isBuffer(raw)) {
+    payload = raw.toString('utf8')
+  }
+  if (!payload) return undefined
+  try {
+    const parsed = JSON.parse(payload) as Comment[]
+    if (!Array.isArray(parsed)) return undefined
+    return parsed.map((comment) => ({
+      ...comment,
+      created_at: new Date(comment.created_at),
+      user: comment.user
+        ? {
+          ...comment.user,
+          created_at: new Date((comment.user as User).created_at)
+        }
+        : comment.user
+    }))
+  } catch (e) {
+    console.error('failed to parse cached comments', e)
+    return undefined
+  }
+}
+
+async function cacheComments(postId: number, allComments: boolean, comments: Comment[]): Promise<void> {
+  const key = commentCacheKey(postId, allComments)
+  return new Promise((resolve) => {
+    memcached.set(key, JSON.stringify(comments), COMMENT_CACHE_TTL, (err) => {
+      if (err) {
+        console.error('memcached set error', err)
+      }
+      resolve()
+    })
+  })
+}
+
+function invalidateCommentCache(postId: number): void {
+  ;[commentCacheKey(postId, true), commentCacheKey(postId, false)].forEach((key) => {
+    memcached.del(key, (err) => {
+      if (err) {
+        console.error('memcached delete error', err)
+      }
+    })
+  })
+}
+
+async function getCachedComments(postIds: number[], allComments: boolean): Promise<Record<number, Comment[]>> {
+  if (postIds.length === 0) return {}
+  const keys = postIds.map((id) => commentCacheKey(id, allComments))
+  const keyToId = new Map<string, number>()
+  keys.forEach((key, idx) => keyToId.set(key, postIds[idx]))
+  return new Promise((resolve) => {
+    memcached.getMulti(keys, (err, data) => {
+      if (err) {
+        console.error('memcached getMulti error', err)
+        resolve({})
+        return
+      }
+      const result: Record<number, Comment[]> = {}
+      for (const [key, value] of Object.entries(data || {})) {
+        const postId = keyToId.get(key)
+        if (!postId) continue
+        const parsed = parseCachedComments(value)
+        if (parsed) {
+          result[postId] = parsed
+        }
+      }
+      resolve(result)
+    })
+  })
+}
+
+async function fetchCommentsForPost(postId: number, allComments: boolean): Promise<Comment[]> {
+  let query = `
+    SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at AS user_created_at
+    FROM comments AS c JOIN users AS u ON c.user_id = u.id
+    WHERE c.post_id = ?
+    ORDER BY c.created_at DESC
+  `
+  if (!allComments) {
     query += ' LIMIT 3'
   }
-  const [commentRows] = await db.query<RowDataPacket[]>(query, [post.id])
-  const comments = await Promise.all((commentRows as Comment[]).map(makeComment))
-  post.comments = comments.reverse()
-  post.user = await getUser(post.user_id)
-  return post
+  const [commentRows] = await db.query<RowDataPacket[]>(query, [postId])
+  const comments = (commentRows as CommentRow[]).map((row) => ({
+    id: row.id,
+    post_id: row.post_id,
+    user_id: row.user_id,
+    comment: row.comment,
+    created_at: row.created_at,
+    user: {
+      id: row.user_id,
+      account_name: row.account_name,
+      passhash: row.passhash || '',
+      authority: row.authority ?? 0,
+      del_flg: row.del_flg ?? 0,
+      created_at: row.user_created_at ?? row.created_at
+    }
+  }))
+  comments.reverse()
+  return comments
 }
 
-async function makePosts(posts: Post[], options: { allComments?: boolean } = {}): Promise<Post[]> {
+async function makePosts(posts: PostRow[], options: CommentOptions = {}): Promise<Post[]> {
+  const allComments = options.allComments ?? false
+  const cachedComments = await getCachedComments(
+    posts.map((post) => post.id),
+    allComments
+  )
   const built: Post[] = []
   for (const post of posts) {
-    const enriched = await makePost(post, options)
-    if (enriched.user && enriched.user.del_flg === 0) {
-      built.push(enriched)
+    const cached = cachedComments[post.id]
+    const comments = cached ?? (await fetchCommentsForPost(post.id, allComments))
+    if (!cached) {
+      void cacheComments(post.id, allComments, comments)
     }
-    if (built.length >= POSTS_PER_PAGE) {
+    const builtPost: Post = {
+      id: post.id,
+      user_id: post.user_id,
+      imgdata: Buffer.alloc(0),
+      body: post.body,
+      mime: post.mime,
+      created_at: post.created_at,
+      comment_count: post.comment_count ?? comments.length,
+      comments,
+      user: {
+        id: post.user_id,
+        account_name: post.account_name,
+        passhash: post.passhash,
+        authority: post.authority,
+        del_flg: post.del_flg,
+        created_at: post.user_created_at
+      }
+    }
+    if (builtPost.user && builtPost.user.del_flg === 0) {
+      built.push(builtPost)
+    }
+    if (!allComments && built.length >= POSTS_PER_PAGE) {
       break
     }
   }
@@ -440,9 +592,31 @@ app.get('/logout', async (c: AppContext) => {
 app.get('/', async (c: AppContext) => {
   try {
     const me = await getSessionUser(c)
-    const [postRows] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
-    const posts = postRows as Post[]
-    const enriched = await makePosts(posts)
+    const [postRows] = await db.query<RowDataPacket[]>(`
+      SELECT
+        p.id,
+        p.user_id,
+        p.body,
+        p.created_at,
+        p.mime,
+        p.comment_count,
+        u.account_name,
+        u.passhash,
+        u.authority,
+        u.del_flg,
+        u.created_at AS user_created_at
+      FROM (
+          SELECT id, user_id, body, created_at, mime, comment_count
+          FROM posts
+          ORDER BY created_at DESC
+          LIMIT 40
+      ) AS p
+      JOIN users AS u ON p.user_id = u.id
+      WHERE u.del_flg = 0
+      ORDER BY p.created_at DESC
+      LIMIT ?
+    `, [POSTS_PER_PAGE])
+    const enriched = await makePosts(postRows as PostRow[])
     return render(c, 'index.ejs', { posts: enriched, me, imageUrl })
   } catch (e) {
     console.error(e)
@@ -456,18 +630,32 @@ app.get('/:accountName{@[A-Za-z0-9_]+}', async (c: AppContext) => {
     const [urows] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', [accountName])
     const user = urows[0] as User
     if (!user) return c.text('not_found', 404)
-    const [postRowData] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC', [user.id])
-    const posts = await makePosts(postRowData as Post[])
+    const [postRowData] = await db.query<RowDataPacket[]>(`
+      SELECT
+        p.id,
+        p.user_id,
+        p.body,
+        p.created_at,
+        p.mime,
+        p.comment_count,
+        u.account_name,
+        u.passhash,
+        u.authority,
+        u.del_flg,
+        u.created_at AS user_created_at
+      FROM posts AS p FORCE INDEX (posts_user_idx)
+      JOIN users AS u ON p.user_id = u.id
+      WHERE p.user_id = ? AND u.del_flg = 0
+      ORDER BY p.created_at DESC
+      LIMIT ?
+    `, [user.id, POSTS_PER_PAGE])
+    const posts = await makePosts(postRowData as PostRow[])
     const [commentCountRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', [user.id])
     const commentCount = (commentCountRows[0] as CountRow | undefined)?.count ?? 0
-    const [postIdRows] = await db.query<RowDataPacket[]>('SELECT `id` FROM `posts` WHERE `user_id` = ?', [user.id])
-    const postIds = (postIdRows as IdRow[]).map((r) => r.id)
-    const postCount = postIds.length
-    let commentedCount = 0
-    if (postCount > 0) {
-      const [countRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?)', [postIds])
-      commentedCount = (countRows[0] as CountRow | undefined)?.count ?? 0
-    }
+    const [[postCountRow]] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?', [user.id])
+    const postCount = (postCountRow as CountRow | undefined)?.count ?? 0
+    const [[commentedSumRow]] = await db.query<RowDataPacket[]>('SELECT COALESCE(SUM(comment_count), 0) AS count FROM `posts` WHERE `user_id` = ?', [user.id])
+    const commentedCount = (commentedSumRow as CountRow | undefined)?.count ?? 0
     const me = await getSessionUser(c)
     return render(c, 'user.ejs', { me, user, posts, post_count: postCount, comment_count: commentCount, commented_count: commentedCount, imageUrl })
   } catch (e) {
@@ -486,18 +674,54 @@ app.get('/posts', async (c: AppContext) => {
     }
     maxCreatedAt = parsed
   }
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC', [maxCreatedAt])
-  const posts = postRows as Post[]
+  let postQuery = `
+    SELECT
+      p.id,
+      p.user_id,
+      p.body,
+      p.created_at,
+      p.mime,
+      p.comment_count,
+      u.account_name,
+      u.passhash,
+      u.authority,
+      u.del_flg,
+      u.created_at AS user_created_at
+    FROM posts AS p JOIN users AS u ON p.user_id = u.id
+    WHERE u.del_flg = 0
+  `
+  const params: Array<Date | number> = []
+  if (maxCreatedAt) {
+    postQuery += ' AND p.created_at < ?'
+    params.push(maxCreatedAt)
+  }
+  postQuery += ' ORDER BY p.created_at DESC LIMIT ?'
+  params.push(POSTS_PER_PAGE)
+  const [postRows] = await db.query<RowDataPacket[]>(postQuery, params)
   const me = await getSessionUser(c)
-  const enriched = await makePosts(posts)
+  const enriched = await makePosts(postRows as PostRow[])
   return render(c, 'posts.ejs', { me, imageUrl, posts: enriched })
 })
 
 app.get('/posts/:id', async (c: AppContext) => {
   const id = c.req.param('id')
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT * FROM `posts` WHERE `id` = ?', [id])
-  const posts = postRows as Post[]
-  const enriched = await makePosts(posts, { allComments: true })
+  const [postRows] = await db.query<RowDataPacket[]>(`
+    SELECT
+      p.id,
+      p.user_id,
+      p.body,
+      p.created_at,
+      p.mime,
+      p.comment_count,
+      u.account_name,
+      u.passhash,
+      u.authority,
+      u.del_flg,
+      u.created_at AS user_created_at
+    FROM posts AS p JOIN users AS u ON p.user_id = u.id
+    WHERE p.id = ? AND u.del_flg = 0
+  `, [id])
+  const enriched = await makePosts(postRows as PostRow[], { allComments: true })
   const post = enriched[0]
   if (!post) return c.text('not found', 404)
   const me = await getSessionUser(c)
@@ -516,7 +740,17 @@ app.post('/', async (c: AppContext) => {
     return c.redirect('/')
   }
   let mime = file.type
-  if (!(mime.includes('jpeg') || mime.includes('png') || mime.includes('gif'))) {
+  let ext = ''
+  if (mime.includes('jpeg')) {
+    mime = 'image/jpeg'
+    ext = 'jpg'
+  } else if (mime.includes('png')) {
+    mime = 'image/png'
+    ext = 'png'
+  } else if (mime.includes('gif')) {
+    mime = 'image/gif'
+    ext = 'gif'
+  } else {
     session.flashNotice = '投稿できる画像形式はjpgとpngとgifだけです'
     return c.redirect('/')
   }
@@ -527,6 +761,14 @@ app.post('/', async (c: AppContext) => {
   const buffer = Buffer.from(await file.arrayBuffer())
   const [result] = await db.query<ResultSetHeader>('INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)', [me.id, mime, buffer, ensureString(body.body)])
   const insertId = result.insertId
+  const imgFile = path.join(IMAGE_DIR, `${insertId}.${ext}`)
+  try {
+    await fs.promises.writeFile(imgFile, buffer, { mode: 0o644 })
+  } catch (e) {
+    console.error('failed to save image', e)
+    session.flashNotice = '画像の保存に失敗しました'
+    return c.redirect('/')
+  }
   return c.redirect(`/posts/${encodeURIComponent(String(insertId))}`)
 })
 
@@ -541,6 +783,12 @@ app.get('/image/:filename{[0-9]+\\.(png|jpg|gif)}', async (c: AppContext) => {
     const post = (posts as Post[])[0]
     if (!post) return c.text('image not found', 404)
     if ((ext === 'jpg' && post.mime === 'image/jpeg') || (ext === 'png' && post.mime === 'image/png') || (ext === 'gif' && post.mime === 'image/gif')) {
+      const imgFile = path.join(IMAGE_DIR, `${post.id}.${ext}`)
+      try {
+        await fs.promises.writeFile(imgFile, post.imgdata, { mode: 0o644 })
+      } catch (err) {
+        console.error('image write error', err)
+      }
       return new Response(new Uint8Array(post.imgdata), { headers: { 'Content-Type': post.mime } })
     }
     return c.text('image not found', 404)
@@ -558,7 +806,10 @@ app.post('/comment', async (c: AppContext) => {
   if (body.csrf_token !== session.csrfToken) return c.text('invalid CSRF Token', 422)
   const postIdString = ensureString(body.post_id)
   if (!/^[0-9]+$/.test(postIdString)) return c.text('post_idは整数のみです')
-  await db.query<ResultSetHeader>('INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)', [Number(postIdString), me.id, ensureString(body.comment)])
+  const postId = Number(postIdString)
+  await db.query<ResultSetHeader>('INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)', [postId, me.id, ensureString(body.comment)])
+  await db.query<ResultSetHeader>('UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?', [postId])
+  invalidateCommentCache(postId)
   return c.redirect(`/posts/${encodeURIComponent(postIdString)}`)
 })
 
